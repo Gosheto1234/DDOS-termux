@@ -61,8 +61,14 @@ def resolve_vendors(hosts: list[str]) -> list[tuple[str,str,str]]:
     parser = manuf.MacParser()
     results = []
     for ip in hosts:
-        mac = neigh.get(ip, "??:??:??:??:??:??")
-        vendor = parser.get_manuf(mac) or "Unknown"
+        mac = neigh.get(ip, None)
+        if not mac or mac.count(':') != 5:
+            vendor = "Unknown"
+        else:
+            try:
+                 vendor = parser.get_manuf(mac) or "Unknown"
+            except Exception:
+                 vendor = "Unknown"
         results.append((ip, mac, vendor))
     return results
 
