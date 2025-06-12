@@ -132,7 +132,11 @@ def _worker_udp(ip, port, packet_size, deadline, iface, rate_ctrl, stats, tid):
                 sock.sendto(payload, dst)
                 sent += 1
             except:
-                pass
+                # If we run out of socket buffers, back off a bit
+                err = sys.exc_info()[1]
+                if hasattr(err, 'errno') and err.errno == errno.ENOBUFS:
+                    time.sleep(0.005)
+                # else ignore other errors
         if time.time() >= next_adj:
             # measure RTT
             try:
